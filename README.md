@@ -1,8 +1,8 @@
 # supercaffeinate
 
-Keeps a Mac fully awake until you turn it off: no system sleep, no display
-sleep, no screensaver, no auto-lock, and closing the lid does not put the
-machine to sleep. Controlled from the terminal or from a small menu bar app.
+Keeps a Mac fully awake until you turn it off, or for a set time: no system
+sleep, no display sleep, no screensaver, no auto-lock, and closing the lid does
+not put the machine to sleep. Controlled from the terminal or from a small menu bar app.
 
 <p align="center"><img src="menubar/icon/AppIcon-1024.png" width="160" alt="SuperCaffeinate app icon"></p>
 
@@ -18,6 +18,10 @@ machine to sleep. Controlled from the terminal or from a small menu bar app.
 
 `supercaffeinate off` undoes all of it and restores normal sleep and lock
 behavior. Each switch posts a notification.
+
+`supercaffeinate on 8h` does the same with an auto-off timer: when the time is
+up the watcher runs the normal off path (the notification says "OFF (timer
+expired)") and the usual sleep and lock behavior comes back.
 
 ### Lid handling
 
@@ -37,7 +41,9 @@ on what is plugged in:
 
 `SuperCaffeinate.app` puts a coffee cup in the menu bar: filled when on,
 outline when off, a warning triangle if the state is stale. Click it to see
-how long the Mac has been held awake and to turn it on or off. It polls the
+how long the Mac has been held awake (or how long is left on a timer) and to
+turn it on or off. Turn On stays on indefinitely; Turn On For... asks for a
+number of hours (0.5 is fine, blank means indefinite). It polls the
 state file every 2 seconds, so changes made from a terminal or a hotkey show up
 right away. It is launched at login by a LaunchAgent. See
 [menubar/README.md](menubar/README.md) for details.
@@ -64,10 +70,16 @@ Make sure `~/bin` is on your `PATH`.
 
 ## Usage
 
-    supercaffeinate on
+    supercaffeinate on [DURATION]
     supercaffeinate off
-    supercaffeinate toggle
+    supercaffeinate toggle [DURATION]
     supercaffeinate status
+
+DURATION is optional. Leave it out (or pass `0`, `inf`, `infinite` or
+`forever`) to stay awake until `off`. Otherwise it is hours, minutes and
+seconds such as `8h`, `90m`, `2h30m` or `45s`, or a bare number of minutes
+(`45`). When the timer runs out supercaffeinate turns itself off. `status`
+shows the time left, e.g. `auto-off in 7h 42m (at 19:35)`.
 
 `toggle` is safe to fire from a hotkey with no terminal: a lock prevents rapid
 presses from stacking. To bind it to a key, point Karabiner-Elements,

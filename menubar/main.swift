@@ -1,8 +1,9 @@
 // SuperCaffeinate: a menu bar item that mirrors ~/bin/supercaffeinate.
 //
 // State model matches the script exactly. /tmp/supercaffeinate.state holds
-// three lines: the "caffeinate -ims" pid, the previous screensaver idleTime,
-// and the lid watcher pid. The script's is_on() is "file exists AND kill -0
+// the "caffeinate -ims" pid, the previous screensaver idleTime, the lid
+// watcher pid, and (line 4, optional) the auto-off deadline in epoch seconds,
+// 0 or missing when there is no timer. The script's is_on() is "file exists AND kill -0
 // pid succeeds", so a state file whose pid is dead is neither on nor off, it
 // is broken, and this app says so instead of guessing.
 
@@ -13,7 +14,7 @@ let scriptPath = NSHomeDirectory() + "/bin/supercaffeinate"
 
 enum CaffState: Equatable {
     case off
-    case on(pid: pid_t, since: Date?)
+    case on(pid: pid_t, since: Date?, deadline: Date?)
     case broken(pid: pid_t)
 }
 
@@ -32,8 +33,14 @@ func readState() -> CaffState {
     // modification time is when the current session started.
     let since = Date(timeIntervalSince1970: TimeInterval(st.st_mtimespec.tv_sec))
 
+    // Line 4: auto-off deadline, absent or 0 when the session is indefinite.
+    var deadline: Date?
+    if lines.count > 3, let secs = TimeInterval(lines[3].trimmingCharacters(in: .whitespaces)), secs > 0 {
+        deadline = Date(timeIntervalSince1970: secs)
+    }
+
     if kill(pid, 0) == 0 {
-        return .on(pid: pid, since: since)
+        return .on(pid: pid, since: since, deadline: deadline)
     }
     return .broken(pid: pid)
 }
@@ -100,7 +107,9 @@ final class Controller: NSObject, NSMenuDelegate {
     func describe(_ s: CaffState) -> String {
         switch s {
         case .off: return "state=off icon=cup.and.saucer"
-        case .on(let pid, _): return "state=on pid=\(pid) icon=cup.and.saucer.fill"
+        case .on(let pid, _, let deadline):
+            let timer = deadline.map { " deadline=\(Int($0.timeIntervalSince1970))" } ?? ""
+            return "state=on pid=\(pid)\(timer) icon=cup.and.saucer.fill"
         case .broken(let pid): return "state=broken pid=\(pid) icon=exclamationmark.triangle"
         }
     }
@@ -136,9 +145,13 @@ final class Controller: NSObject, NSMenuDelegate {
         fmt.dateFormat = "HH:mm"
 
         switch state {
-        case .on(_, let since):
-            let when = since.map { " since " + fmt.string(from: $0) } ?? ""
-            menu.addItem(disabled("Awake," + (when.isEmpty ? " on" : when)))
+        case .on(_, let since, let deadline):
+            if let deadline = deadline {
+                menu.addItem(disabled("Awake, " + remaining(until: deadline)))
+            } else {
+                let when = since.map { " since " + fmt.string(from: $0) } ?? ""
+                menu.addItem(disabled("Awake," + (when.isEmpty ? " on" : when)))
+            }
             menu.addItem(disabled(lidClosed()
                 ? "Lid closed: screen black, system running"
                 : "Lid open: display held awake"))
@@ -151,18 +164,21 @@ final class Controller: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        let action: NSMenuItem
+        var actions: [NSMenuItem] = []
         switch state {
         case .on:
-            action = NSMenuItem(title: "Turn Off", action: #selector(turnOff), keyEquivalent: "")
+            actions.append(NSMenuItem(title: "Turn Off", action: #selector(turnOff), keyEquivalent: ""))
         case .off:
-            action = NSMenuItem(title: "Turn On", action: #selector(turnOn), keyEquivalent: "")
+            actions.append(NSMenuItem(title: "Turn On", action: #selector(turnOn), keyEquivalent: ""))
+            actions.append(NSMenuItem(title: "Turn On For...", action: #selector(turnOnFor), keyEquivalent: ""))
         case .broken:
-            action = NSMenuItem(title: "Clean Up (Turn Off)", action: #selector(turnOff), keyEquivalent: "")
+            actions.append(NSMenuItem(title: "Clean Up (Turn Off)", action: #selector(turnOff), keyEquivalent: ""))
         }
-        action.target = self
-        action.isEnabled = !busy
-        menu.addItem(action)
+        for action in actions {
+            action.target = self
+            action.isEnabled = !busy
+            menu.addItem(action)
+        }
 
         menu.addItem(.separator())
 
@@ -171,24 +187,86 @@ final class Controller: NSObject, NSMenuDelegate {
         menu.addItem(quit)
     }
 
+    // "7h 42m left", minutes rounded up so it never reads 0m while still on.
+    func remaining(until deadline: Date) -> String {
+        let secs = Int(deadline.timeIntervalSinceNow)
+        if secs <= 0 { return "turning off" }
+        let mins = (secs + 59) / 60
+        let h = mins / 60
+        let m = mins % 60
+        if h > 0 && m > 0 { return "\(h)h \(m)m left" }
+        if h > 0 { return "\(h)h left" }
+        return "\(m)m left"
+    }
+
     func disabled(_ title: String) -> NSMenuItem {
         let mi = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         mi.isEnabled = false
         return mi
     }
 
-    @objc func turnOn() { run("on") }
-    @objc func turnOff() { run("off") }
+    @objc func turnOn() { run(["on"]) }
+    @objc func turnOff() { run(["off"]) }
+
+    // Asks for a number of hours. Empty or 0 means indefinite; anything else
+    // must be a number greater than 0 and at most 1000, or the alert comes
+    // back with an error line and nothing runs.
+    @objc func turnOnFor() {
+        let prompt = "Enter hours, or leave blank for indefinite. It turns itself off when the time is up."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        field.placeholderString = "Hours, e.g. 8 or 0.5"
+
+        let label = NSTextField(labelWithString: "Hours")
+        let row = NSStackView(views: [label, field])
+        row.orientation = .horizontal
+        row.spacing = 8
+        row.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
+
+        var error: String?
+        while true {
+            let alert = NSAlert()
+            alert.messageText = "Turn On For..."
+            alert.informativeText = error.map { prompt + "\n" + $0 } ?? prompt
+            alert.addButton(withTitle: "Turn On")
+            alert.addButton(withTitle: "Cancel")
+            alert.accessoryView = row
+            alert.window.initialFirstResponder = field
+
+            NSApp.activate(ignoringOtherApps: true)
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+            let text = field.stringValue.trimmingCharacters(in: .whitespaces)
+            if text.isEmpty {
+                run(["on"])
+                return
+            }
+            guard let hours = Double(text), hours.isFinite, hours >= 0, hours <= 1000 else {
+                error = "\"\(text)\" is not a valid number of hours (0 to 1000)."
+                continue
+            }
+            if hours == 0 {
+                run(["on"])
+                return
+            }
+            let minutes = Int((hours * 60).rounded())
+            if minutes < 1 {
+                error = "That is under a minute. Enter at least 0.02 hours."
+                continue
+            }
+            run(["on", "\(minutes)m"])
+            return
+        }
+    }
 
     // The script can take a moment (sudo pmset, pkill sweeps), so it never
     // runs on the main thread.
-    func run(_ verb: String) {
+    func run(_ args: [String]) {
         if busy { return }
         busy = true
         DispatchQueue.global(qos: .userInitiated).async {
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: scriptPath)
-            proc.arguments = [verb]
+            proc.arguments = args
             proc.standardOutput = FileHandle.nullDevice
             proc.standardError = FileHandle.nullDevice
             try? proc.run()

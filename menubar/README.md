@@ -9,9 +9,14 @@ machine is being held awake, and lets you flip it without a terminal.
   something died badly and `supercaffeinate off` should be run to clean up
 
 The icon is a template SF Symbol, so it follows light and dark menu bars on its
-own. Clicking it opens a menu with the status line ("Awake, since HH:MM" or
-"Off"), the lid line when on, a Turn On / Turn Off item that runs
-`~/bin/supercaffeinate on|off`, and Quit.
+own. Clicking it opens a menu with the status line ("Awake, since HH:MM",
+"Awake, 7h 42m left" or "Off"), the lid line when on, Turn On / Turn Off items
+that run `~/bin/supercaffeinate on|off`, and Quit.
+
+When off there are two ways to turn on: Turn On (indefinite) and Turn On
+For..., which asks for a number of hours (decimals like 0.5 are fine, blank or 0
+means indefinite) and runs `supercaffeinate on <minutes>m`, so the script turns
+itself off when the time is up.
 
 ## How it decides
 
@@ -23,7 +28,9 @@ is only queried with `ioreg` when the menu is about to open. Turning on and off
 runs off the main thread so the menu bar never stalls.
 
 The "since" time comes from the modification time of the state file, which the
-script writes the moment it turns on.
+script writes the moment it turns on. When a timer is set, line 4 of the state
+file holds the auto-off deadline (epoch seconds) and the status line shows the
+time left instead, e.g. "Awake, 7h 42m left".
 
 ## Build
 

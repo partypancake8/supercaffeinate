@@ -1,5 +1,5 @@
 #!/bin/bash
-# supercaffeinate on|off|toggle|status
+# supercaffeinate on [DURATION]|off|toggle [DURATION]|status
 # Keeps the machine fully awake: no system sleep, no display sleep, no
 # screensaver, no auto-lock, and sleep is hard-disabled (lid close / Apple
 # menu > Sleep do nothing).
@@ -13,6 +13,11 @@
 # runs from stacking and pmset uses sudo -n (needs the
 # /etc/sudoers.d/supercaffeinate NOPASSWD rule). Posts an "ON"/"OFF"
 # notification on each switch. Everything clears on reboot (state lives in /tmp).
+# Optional auto-off timer: DURATION is 8h, 90m, 2h30m, 45s or a bare number of
+# minutes (45). Omitted, 0, inf, infinite or forever means no timer. When the
+# timer runs out the watcher runs the normal off path, so the usual sleep and
+# lock behavior comes back. The deadline (epoch seconds, 0 = none) is line 4 of
+# the state file.
 
 STATE=/tmp/supercaffeinate.state
 DCAF_PID=/tmp/supercaffeinate.dcaf.pid
@@ -23,6 +28,51 @@ SELF="$0"
 while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
 SCREENBLANK="$(cd "$(dirname "$SELF")" && pwd)/screenblank"
 [ -x "$SCREENBLANK" ] || SCREENBLANK="$HOME/bin/screenblank"
+
+# Duration string to seconds on stdout; 0 means no timer. Returns 1 on bad input.
+parse_duration() {
+  local s total n u
+  s=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+  total=0
+  case "$s" in
+    ""|0|inf|infinite|forever) echo 0; return 0 ;;
+  esac
+  if [[ "$s" =~ ^[0-9]+$ ]]; then
+    echo $(( 10#$s * 60 ))
+    return 0
+  fi
+  [[ "$s" =~ ^([0-9]+[hms])+$ ]] || return 1
+  while [[ "$s" =~ ^([0-9]+)([hms])(.*)$ ]]; do
+    n=$(( 10#${BASH_REMATCH[1]} ))
+    u=${BASH_REMATCH[2]}
+    s=${BASH_REMATCH[3]}
+    case "$u" in
+      h) total=$(( total + n * 3600 )) ;;
+      m) total=$(( total + n * 60 )) ;;
+      s) total=$(( total + n )) ;;
+    esac
+  done
+  echo "$total"
+}
+
+# Seconds to "7h 42m", "8h", "45m" (minutes rounded up), or "30s" under a minute.
+fmt_duration() {
+  local secs=$1 mins h m
+  if [ "$secs" -lt 60 ]; then
+    echo "${secs}s"
+    return
+  fi
+  mins=$(( (secs + 59) / 60 ))
+  h=$(( mins / 60 ))
+  m=$(( mins % 60 ))
+  if [ "$h" -gt 0 ] && [ "$m" -gt 0 ]; then
+    echo "${h}h ${m}m"
+  elif [ "$h" -gt 0 ]; then
+    echo "${h}h"
+  else
+    echo "${m}m"
+  fi
+}
 
 notify() {
   osascript -e "display notification \"$1\" with title \"supercaffeinate\""
@@ -84,9 +134,18 @@ unblank_screen() {
 # close = screen to black via screenblank, open = kill it (gamma auto-restores).
 # Re-evaluated every tick: while an external display is online the blank is
 # never applied (closed + external = unblanked, unplug while closed = blanked).
+# $1 is the auto-off deadline in epoch seconds (0 or empty = none). When it
+# passes, a detached "__expire" run does the normal off path and this loop
+# exits, so off never has to kill the process it is running in.
 lid_watcher() {
   was_blank=""
+  deadline=${1:-0}
   while true; do
+    if [ "$deadline" -gt 0 ] && [ "$(date +%s)" -ge "$deadline" ]; then
+      "$0" __expire </dev/null >>/tmp/supercaffeinate.log 2>&1 &
+      exit 0
+    fi
+
     # Always keep the display-hold caffeinate alive.
     if [ ! -f "$DCAF_PID" ] || ! kill -0 "$(cat "$DCAF_PID")" 2>/dev/null; then
       caffeinate -du &
@@ -118,12 +177,22 @@ status() {
     else
       echo "lid open: display held awake"
     fi
+    DEADLINE=$(sed -n 4p "$STATE")
+    if [ -n "$DEADLINE" ] && [ "$DEADLINE" -gt 0 ] 2>/dev/null; then
+      LEFT=$(( DEADLINE - $(date +%s) ))
+      [ "$LEFT" -lt 0 ] && LEFT=0
+      echo "auto-off in $(fmt_duration "$LEFT") (at $(date -r "$DEADLINE" +%H:%M))"
+    else
+      echo "no auto-off (infinite)"
+    fi
   else
     echo "supercaffeinate is OFF"
   fi
 }
 
+# $1 = timer length in seconds, 0 or empty = no timer.
 do_on() {
+  DUR=${1:-0}
   if is_on; then
     echo "Already on."
     return 0
@@ -137,11 +206,15 @@ do_on() {
   # Remember current screensaver idle time before zeroing it.
   PREV_IDLE=$(defaults -currentHost read com.apple.screensaver idleTime 2>/dev/null || echo 1200)
 
-  "$0" __watch &
+  DEADLINE=0
+  [ "$DUR" -gt 0 ] && DEADLINE=$(( $(date +%s) + DUR ))
+
+  "$0" __watch "$DEADLINE" &
   WATCHPID=$!
 
   # Write state FIRST so even a partially failed on can be toggled off.
-  printf '%s\n%s\n%s\n' "$CAFPID" "$PREV_IDLE" "$WATCHPID" > "$STATE"
+  # Lines 1 to 3 are read by the menu bar app; line 4 is the auto-off deadline.
+  printf '%s\n%s\n%s\n%s\n' "$CAFPID" "$PREV_IDLE" "$WATCHPID" "$DEADLINE" > "$STATE"
 
   defaults -currentHost write com.apple.screensaver idleTime -int 0
 
@@ -154,11 +227,18 @@ do_on() {
   echo "ON. No sleep, no screensaver, no auto-lock."
   echo "Lid open: display stays on. Lid closed: screen dims to black, work keeps running."
   echo "External display connected: lid-closed blank is skipped so the external screen stays on."
-  echo "Turn off with: supercaffeinate off  (or just reboot)"
-  notify "ON"
+  if [ "$DEADLINE" -gt 0 ]; then
+    echo "Auto-off at $(date -r "$DEADLINE" +%H:%M) (in $(fmt_duration "$DUR"))."
+    notify "ON for $(fmt_duration "$DUR")"
+  else
+    echo "Turn off with: supercaffeinate off  (or just reboot)"
+    notify "ON"
+  fi
 }
 
+# $1 = optional reason shown in the output and notification.
 do_off() {
+  REASON=${1:+ ($1)}
   # Stop processes and clear state FIRST so off always de-caffeinates,
   # even if the privileged restore steps below fail.
   if [ -f "$STATE" ]; then
@@ -190,18 +270,37 @@ do_off() {
     echo "warning: sudo -n pmset failed (run supercaffeinate-setup); disablesleep may still be 1" >&2
   fi
 
-  echo "OFF. Normal sleep/lock behavior restored."
-  notify "OFF"
+  echo "OFF$REASON. Normal sleep/lock behavior restored."
+  notify "OFF$REASON"
 }
+
+# Validate the duration before touching any state.
+if [ "$1" = on ] || [ "$1" = toggle ]; then
+  if ! DUR_SECS=$(parse_duration "$2"); then
+    echo "invalid duration: $2 (examples: 8h, 90m, 2h30m, 45)" >&2
+    exit 1
+  fi
+fi
 
 case "$1" in
   __watch)
-    lid_watcher
+    lid_watcher "$2"
+    ;;
+
+  __expire)
+    # Started by the watcher when the timer runs out. Wait out a concurrent
+    # run (hotkey, menu bar) rather than dropping the auto-off.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      acquire_lock 2>/dev/null && break
+      sleep 1
+    done
+    [ -d "$LOCKDIR" ] && [ "$(cat "$LOCKDIR/pid" 2>/dev/null)" = "$$" ] || exit 1
+    is_on && do_off "timer expired"
     ;;
 
   on)
     acquire_lock || exit 1
-    do_on
+    do_on "$DUR_SECS"
     ;;
 
   off)
@@ -214,7 +313,7 @@ case "$1" in
     if is_on; then
       do_off
     else
-      do_on
+      do_on "$DUR_SECS"
     fi
     ;;
 
@@ -223,7 +322,9 @@ case "$1" in
     ;;
 
   *)
-    echo "Usage: supercaffeinate on|off|toggle|status"
+    echo "Usage: supercaffeinate on [DURATION]|off|toggle [DURATION]|status"
+    echo "  DURATION: 8h, 90m, 2h30m, 45s, or a bare number of minutes (45)."
+    echo "  Omit it (or use 0, inf, forever) to stay awake until off."
     exit 1
     ;;
 esac
