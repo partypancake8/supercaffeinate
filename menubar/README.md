@@ -9,8 +9,11 @@ machine is being held awake, and lets you flip it without a terminal.
   something died badly and `supercaffeinate off` should be run to clean up
 
 The icon is a template SF Symbol, so it follows light and dark menu bars on its
-own. Clicking it opens a menu with the status line ("Awake, since HH:MM",
-"Awake, 7h 42m left" or "Off"), the lid line when on, Turn On / Turn Off items
+own. Clicking it opens a menu with the status line ("Awake ∞, since HH:MM"
+when there is no timer, "Awake, 7h 42m left" with one, or "Off"), the lid line
+when on ("Lid open: display held awake", "Lid closed: screen black, system
+running", or "Lid closed: showing on external display" in clamshell mode, where
+the script skips the blackout), Turn On / Turn Off items
 that run `~/bin/supercaffeinate on|off`, and Quit.
 
 When off there are two ways to turn on: Turn On (indefinite) and Turn On
@@ -18,19 +21,37 @@ For..., which asks for a number of hours (decimals like 0.5 are fine, blank or 0
 means indefinite) and runs `supercaffeinate on <minutes>m`, so the script turns
 itself off when the time is up.
 
+## Notifications
+
+While the app is running it posts the "ON", "ON for 8h", "OFF" and "OFF (timer
+expired)" notifications itself, with the SuperCaffeinate icon, and the script
+skips its own `osascript` notification. So the app has to be allowed in System
+Settings > Notifications (macOS asks once, on first launch), and in the allow
+list of any Focus mode you want them to break through. Only when the app is not
+running does the script fall back to `osascript`, which shows up as Script
+Editor. The app sees a switch on its next poll, so its notification can arrive
+up to 2 seconds after the change. It never posts for the state it finds at
+launch.
+
 ## How it decides
 
 Same test as the script: `/tmp/supercaffeinate.state` must exist and `kill -0`
 on its first line (the `caffeinate -ims` pid) must succeed. The poll is a stat
 plus a `kill(pid, 0)` every 2 seconds, no subprocess, so state changes made from
-anywhere else (a hotkey, a terminal) show up within a couple of seconds. The lid
-is only queried with `ioreg` when the menu is about to open. Turning on and off
+anywhere else (a hotkey, a terminal) show up within a couple of seconds. The lid,
+and whether an external display is connected, are only queried with `ioreg` when
+the menu is about to open. Turning on and off
 runs off the main thread so the menu bar never stalls.
 
 The "since" time comes from the modification time of the state file, which the
 script writes the moment it turns on. When a timer is set, line 4 of the state
 file holds the auto-off deadline (epoch seconds) and the status line shows the
 time left instead, e.g. "Awake, 7h 42m left".
+
+When the timer runs out, the script writes `timer expired` to
+`/tmp/supercaffeinate.offreason` just before its normal off path; a plain off
+never writes it. On the off transition the app reads and deletes that file and
+adds the reason to its notification ("OFF (timer expired)").
 
 ## Build
 

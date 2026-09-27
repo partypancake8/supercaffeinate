@@ -17,7 +17,10 @@ not put the machine to sleep. Controlled from the terminal or from a small menu 
 - starts a small watcher that follows the lid once a second
 
 `supercaffeinate off` undoes all of it and restores normal sleep and lock
-behavior. Each switch posts a notification.
+behavior. Each switch posts a notification. While the menu bar app is running
+it posts them with its own icon, so allow SuperCaffeinate in System Settings >
+Notifications (and in any Focus mode allow list); when the app is not running
+the script falls back to `osascript`, which shows up as Script Editor.
 
 `supercaffeinate on 8h` does the same with an auto-off timer: when the time is
 up the watcher runs the normal off path (the notification says "OFF (timer

@@ -12,7 +12,7 @@
 # Hotkey-safe (toggle can run with no terminal): a lock dir prevents concurrent
 # runs from stacking and pmset uses sudo -n (needs the
 # /etc/sudoers.d/supercaffeinate NOPASSWD rule). Posts an "ON"/"OFF"
-# notification on each switch. Everything clears on reboot (state lives in /tmp).
+# notification on each switch (via the menu bar app when it is running). Everything clears on reboot (state lives in /tmp).
 # Optional auto-off timer: DURATION is 8h, 90m, 2h30m, 45s or a bare number of
 # minutes (45). Omitted, 0, inf, infinite or forever means no timer. When the
 # timer runs out the watcher runs the normal off path, so the usual sleep and
@@ -23,6 +23,9 @@ STATE=/tmp/supercaffeinate.state
 DCAF_PID=/tmp/supercaffeinate.dcaf.pid
 LOCKDIR=/tmp/supercaffeinate.lock
 BLANK_PID=/tmp/supercaffeinate.blank.pid
+# Reason for an automatic off ("timer expired"), read and deleted by the menu
+# bar app so its OFF notification can say why. A plain off never writes it.
+OFFREASON=/tmp/supercaffeinate.offreason
 # screenblank lives next to this script (install.sh puts both in ~/bin).
 SELF="$0"
 while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
@@ -74,7 +77,13 @@ fmt_duration() {
   fi
 }
 
+# While the menu bar app is running it sees the switch within 2 s and posts the
+# notification itself, with its own icon. osascript is only the fallback (it
+# shows up as Script Editor).
 notify() {
+  if pgrep -f 'SuperCaffeinate.app/Contents/MacOS/SuperCaffeinate' >/dev/null; then
+    return 0
+  fi
   osascript -e "display notification \"$1\" with title \"supercaffeinate\""
 }
 
@@ -198,6 +207,9 @@ do_on() {
     return 0
   fi
 
+  # A leftover reason from an expiry the app never saw must not label a later off.
+  rm -f "$OFFREASON"
+
   # Hold assertions: i=idle, m=disk, s=system (AC). The display hold lives in
   # the lid watcher.
   caffeinate -ims &
@@ -295,7 +307,10 @@ case "$1" in
       sleep 1
     done
     [ -d "$LOCKDIR" ] && [ "$(cat "$LOCKDIR/pid" 2>/dev/null)" = "$$" ] || exit 1
-    is_on && do_off "timer expired"
+    if is_on; then
+      echo "timer expired" > "$OFFREASON"
+      do_off "timer expired"
+    fi
     ;;
 
   on)

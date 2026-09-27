@@ -8,8 +8,12 @@
 // is broken, and this app says so instead of guessing.
 
 import AppKit
+import UserNotifications
 
 let statePath = "/tmp/supercaffeinate.state"
+// Written by the script's timer-expiry path just before it turns off; read and
+// deleted here when the off transition is seen, so the notification can say why.
+let offReasonPath = "/tmp/supercaffeinate.offreason"
 let scriptPath = NSHomeDirectory() + "/bin/supercaffeinate"
 
 enum CaffState: Equatable {
@@ -45,31 +49,57 @@ func readState() -> CaffState {
     return .broken(pid: pid)
 }
 
-// Only asked for when the menu is about to open, never on a poll tick.
-func lidClosed() -> Bool {
+// Runs ioreg with the given arguments and returns its stdout. Only used when
+// the menu is about to open, never on a poll tick.
+func ioreg(_ args: [String]) -> String {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/usr/sbin/ioreg")
-    proc.arguments = ["-r", "-k", "AppleClamshellState", "-d", "1"]
+    proc.arguments = args
     let pipe = Pipe()
     proc.standardOutput = pipe
     proc.standardError = FileHandle.nullDevice
     do {
         try proc.run()
     } catch {
-        return false
+        return ""
     }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     proc.waitUntilExit()
-    let out = String(data: data, encoding: .utf8) ?? ""
-    return out.contains("\"AppleClamshellState\" = Yes")
+    return String(data: data, encoding: .utf8) ?? ""
 }
 
-final class Controller: NSObject, NSMenuDelegate {
+func lidClosed() -> Bool {
+    ioreg(["-r", "-k", "AppleClamshellState", "-d", "1"]).contains("\"AppleClamshellState\" = Yes")
+}
+
+// Same test as the script's external_display_online: the DCP AV service proxy
+// with Location External exists only while an external display is connected.
+// In that case the script skips the lid-closed blank (clamshell mode).
+func externalDisplayOnline() -> Bool {
+    ioreg(["-r", "-c", "DCPAVServiceProxy", "-d", "1"]).contains("\"Location\" = \"External\"")
+}
+
+// Seconds to "7h 42m", "8h", "45m" (minutes rounded up), or "30s" under a
+// minute. Same wording as the script's fmt_duration.
+func formatDuration(_ secs: Int) -> String {
+    if secs < 60 { return "\(max(secs, 0))s" }
+    let mins = (secs + 59) / 60
+    let h = mins / 60
+    let m = mins % 60
+    if h > 0 && m > 0 { return "\(h)h \(m)m" }
+    if h > 0 { return "\(h)h" }
+    return "\(m)m"
+}
+
+final class Controller: NSObject, NSMenuDelegate, UNUserNotificationCenterDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let menu = NSMenu()
     var state: CaffState = .off
     var timer: Timer?
     var busy = false
+    // False until the first poll has seeded the state, so launching the app
+    // never posts a notification for a switch it did not see happen.
+    var seeded = false
 
     override init() {
         super.init()
@@ -90,9 +120,74 @@ final class Controller: NSObject, NSMenuDelegate {
     func refresh(force: Bool) {
         let new = readState()
         if !force && new == state { return }
+        let old = state
         state = new
+        if seeded {
+            notifyTransition(from: old, to: new)
+        }
+        seeded = true
         applyIcon()
         log(describe(new))
+    }
+
+    // Notifications are posted from here rather than by the script's
+    // osascript call, so they carry this app's icon. The script skips its own
+    // notification while this app is running.
+    func startNotifications() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound]) { granted, error in
+            if let error = error {
+                FileHandle.standardError.write(Data("notification authorization error: \(error)\n".utf8))
+            } else {
+                self.log("notification authorization granted=\(granted)")
+            }
+        }
+    }
+
+    func notifyTransition(from old: CaffState, to new: CaffState) {
+        switch (old, new) {
+        case (.on, .on), (.off, .off), (.broken, .broken), (.off, .broken):
+            return
+        case (_, .on(_, let since, let deadline)):
+            if let deadline = deadline, let since = since {
+                let secs = Int(deadline.timeIntervalSince1970 - since.timeIntervalSince1970)
+                post("ON for " + formatDuration(secs))
+            } else {
+                post("ON")
+            }
+        case (_, .off):
+            var reason = ""
+            if let text = try? String(contentsOfFile: offReasonPath, encoding: .utf8) {
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { reason = " (\(trimmed))" }
+                try? FileManager.default.removeItem(atPath: offReasonPath)
+            }
+            post("OFF" + reason)
+        case (.on, .broken):
+            return
+        }
+    }
+
+    func post(_ body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "supercaffeinate"
+        content.body = body
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error {
+                FileHandle.standardError.write(Data("notification post error: \(error)\n".utf8))
+            }
+        }
+        log("notify " + body)
+    }
+
+    // Show the banner even while this app is frontmost (for example while the
+    // Turn On For... alert is up).
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .list])
     }
 
     // One line per state change on stdout. Under the LaunchAgent that lands in
@@ -149,12 +244,17 @@ final class Controller: NSObject, NSMenuDelegate {
             if let deadline = deadline {
                 menu.addItem(disabled("Awake, " + remaining(until: deadline)))
             } else {
-                let when = since.map { " since " + fmt.string(from: $0) } ?? ""
-                menu.addItem(disabled("Awake," + (when.isEmpty ? " on" : when)))
+                // No timer: the infinity sign marks an indefinite session.
+                let when = since.map { ", since " + fmt.string(from: $0) } ?? ""
+                menu.addItem(disabled("Awake \u{221E}" + when))
             }
-            menu.addItem(disabled(lidClosed()
-                ? "Lid closed: screen black, system running"
-                : "Lid open: display held awake"))
+            if !lidClosed() {
+                menu.addItem(disabled("Lid open: display held awake"))
+            } else if externalDisplayOnline() {
+                menu.addItem(disabled("Lid closed: showing on external display"))
+            } else {
+                menu.addItem(disabled("Lid closed: screen black, system running"))
+            }
         case .off:
             menu.addItem(disabled("Off"))
         case .broken(let pid):
@@ -191,12 +291,8 @@ final class Controller: NSObject, NSMenuDelegate {
     func remaining(until deadline: Date) -> String {
         let secs = Int(deadline.timeIntervalSinceNow)
         if secs <= 0 { return "turning off" }
-        let mins = (secs + 59) / 60
-        let h = mins / 60
-        let m = mins % 60
-        if h > 0 && m > 0 { return "\(h)h \(m)m left" }
-        if h > 0 { return "\(h)h left" }
-        return "\(m)m left"
+        // Whole minutes here, even under a minute, so it never reads 0m.
+        return formatDuration(max(secs, 60)) + " left"
     }
 
     func disabled(_ title: String) -> NSMenuItem {
@@ -213,14 +309,21 @@ final class Controller: NSObject, NSMenuDelegate {
     // back with an error line and nothing runs.
     @objc func turnOnFor() {
         let prompt = "Enter hours, or leave blank for indefinite. It turns itself off when the time is up."
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
-        field.placeholderString = "Hours, e.g. 8 or 0.5"
+        // NSAlert sizes the accessory view from its frame and does not run
+        // autolayout inside it, so every subview gets an explicit frame.
+        let row = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
 
         let label = NSTextField(labelWithString: "Hours")
-        let row = NSStackView(views: [label, field])
-        row.orientation = .horizontal
-        row.spacing = 8
-        row.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
+        label.font = NSFont.systemFont(ofSize: 13)
+        label.frame = NSRect(x: 0, y: 3, width: 50, height: 18)
+        row.addSubview(label)
+
+        let field = NSTextField(frame: NSRect(x: 56, y: 0, width: 200, height: 24))
+        field.font = NSFont.systemFont(ofSize: 13)
+        field.placeholderString = "e.g. 8"
+        field.isEditable = true
+        field.isSelectable = true
+        row.addSubview(field)
 
         var error: String?
         while true {
@@ -230,7 +333,8 @@ final class Controller: NSObject, NSMenuDelegate {
             alert.addButton(withTitle: "Turn On")
             alert.addButton(withTitle: "Cancel")
             alert.accessoryView = row
-            alert.window.initialFirstResponder = field
+            alert.layout()
+            alert.window.makeFirstResponder(field)
 
             NSApp.activate(ignoringOtherApps: true)
             guard alert.runModal() == .alertFirstButtonReturn else { return }
@@ -297,4 +401,5 @@ if CommandLine.arguments.contains("--dump-menu") {
     exit(0)
 }
 
+controller.startNotifications()
 app.run()
