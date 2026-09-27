@@ -1,0 +1,74 @@
+#!/bin/bash
+# supercaffeinate-setup
+# One-time setup so supercaffeinate can run from a hotkey or the menu bar
+# without a password prompt:
+#   1. Installs /etc/sudoers.d/supercaffeinate, a NOPASSWD rule for the current
+#      user limited to exactly `pmset -a disablesleep 1` and `pmset -a disablesleep 0`
+#      (asks for your admin password once).
+#   2. Checks that the screenblank helper is installed (install.sh builds it).
+#   3. Turns off any old running supercaffeinate.
+# Safe to re-run: each step skips itself if already done.
+
+SUDOERS_DST=/etc/sudoers.d/supercaffeinate
+ME="$(id -un)"
+RULE="$ME ALL=(ALL) NOPASSWD: /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset -a disablesleep 0"
+
+SELF="$0"
+while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+echo "== supercaffeinate setup =="
+echo
+
+# 1. sudoers rule so pmset can run without a password prompt
+TMP=$(mktemp)
+printf '%s\n' "$RULE" > "$TMP"
+
+if [ -r "$SUDOERS_DST" ] && diff -q "$SUDOERS_DST" "$TMP" >/dev/null 2>&1; then
+  SUDOERS_RESULT="skipped (already installed)"
+  echo "[1/3] sudoers rule already installed, skipping."
+else
+  echo "[1/3] Installing sudoers rule for user $ME. The sudo prompt below wants your admin (login) password."
+  if ! visudo -c -f "$TMP" >/dev/null; then
+    echo "error: generated sudoers rule failed visudo check, not installing" >&2
+    rm -f "$TMP"
+    exit 1
+  fi
+  if sudo install -m 440 -o root -g wheel "$TMP" "$SUDOERS_DST" && sudo visudo -c >/dev/null; then
+    SUDOERS_RESULT="installed"
+    echo "sudoers rule installed and validated."
+  else
+    SUDOERS_RESULT="FAILED"
+    echo "error: sudoers install or validation failed" >&2
+  fi
+fi
+rm -f "$TMP"
+echo
+
+# 2. screenblank helper for the lid-close blackout
+if [ -x "$BIN_DIR/screenblank" ] || [ -x "$HOME/bin/screenblank" ]; then
+  BLANK_RESULT="present"
+  echo "[2/3] screenblank helper found."
+else
+  BLANK_RESULT="MISSING (run ./install.sh from the repo)"
+  echo "[2/3] warning: screenblank helper not found; run ./install.sh from the repo to build it." >&2
+fi
+echo
+
+# 3. Clear any old running supercaffeinate
+if [ -f /tmp/supercaffeinate.state ] || pgrep -f 'caffeinate -dimsu' >/dev/null 2>&1; then
+  echo "[3/3] Old supercaffeinate still running, turning it off."
+  "$BIN_DIR/supercaffeinate" off
+  OLD_RESULT="turned off"
+else
+  OLD_RESULT="skipped (not running)"
+  echo "[3/3] No old supercaffeinate running, skipping."
+fi
+echo
+
+echo "== Setup done =="
+echo "sudoers rule:  $SUDOERS_RESULT"
+echo "screenblank:   $BLANK_RESULT"
+echo "old instance:  $OLD_RESULT"
+echo
+echo "Run 'supercaffeinate toggle' or use the menu bar item."

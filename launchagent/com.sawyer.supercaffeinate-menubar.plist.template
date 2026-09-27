@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.sawyer.supercaffeinate-menubar</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/Applications/SuperCaffeinate.app/Contents/MacOS/SuperCaffeinate</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/supercaffeinate-menubar.out</string>
+  <key>StandardErrorPath</key><string>/tmp/supercaffeinate-menubar.err</string>
+  <key>ProcessType</key><string>Interactive</string>
+</dict>
+</plist>

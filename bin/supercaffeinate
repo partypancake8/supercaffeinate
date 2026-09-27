@@ -1,0 +1,229 @@
+#!/bin/bash
+# supercaffeinate on|off|toggle|status
+# Keeps the machine fully awake: no system sleep, no display sleep, no
+# screensaver, no auto-lock, and sleep is hard-disabled (lid close / Apple
+# menu > Sleep do nothing).
+# Lid behavior: the display is held awake the whole time (so the "require
+# password after display off" lock never triggers); closing the lid blacks out
+# the screen via the screenblank helper (gamma to zero, no display sleep), reopening
+# kills the helper which restores the screen automatically.
+# With an external display online (clamshell mode) the lid-closed blank is
+# skipped, and any active blank is undone, so the external screen stays visible.
+# Hotkey-safe (toggle can run with no terminal): a lock dir prevents concurrent
+# runs from stacking and pmset uses sudo -n (needs the
+# /etc/sudoers.d/supercaffeinate NOPASSWD rule). Posts an "ON"/"OFF"
+# notification on each switch. Everything clears on reboot (state lives in /tmp).
+
+STATE=/tmp/supercaffeinate.state
+DCAF_PID=/tmp/supercaffeinate.dcaf.pid
+LOCKDIR=/tmp/supercaffeinate.lock
+BLANK_PID=/tmp/supercaffeinate.blank.pid
+# screenblank lives next to this script (install.sh puts both in ~/bin).
+SELF="$0"
+while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
+SCREENBLANK="$(cd "$(dirname "$SELF")" && pwd)/screenblank"
+[ -x "$SCREENBLANK" ] || SCREENBLANK="$HOME/bin/screenblank"
+
+notify() {
+  osascript -e "display notification \"$1\" with title \"supercaffeinate\""
+}
+
+lid_closed() {
+  ioreg -r -k AppleClamshellState -d 1 | grep -q '"AppleClamshellState" = Yes'
+}
+
+# 0 when any non-built-in display is online. The DCP AV service proxy with
+# Location External exists only while an external display is connected
+# (fast, ~20 ms, safe to run every second).
+external_display_online() {
+  ioreg -r -c DCPAVServiceProxy -d 1 2>/dev/null | grep -q '"Location" = "External"'
+}
+
+is_on() {
+  [ -f "$STATE" ] && kill -0 "$(head -1 "$STATE")" 2>/dev/null
+}
+
+# One instance at a time: rapid hotkey presses must not stack instances.
+acquire_lock() {
+  if mkdir "$LOCKDIR" 2>/dev/null; then
+    echo $$ > "$LOCKDIR/pid"
+    trap 'rm -rf "$LOCKDIR"' EXIT
+    return 0
+  fi
+  OTHER=$(cat "$LOCKDIR/pid" 2>/dev/null)
+  if [ -n "$OTHER" ] && kill -0 "$OTHER" 2>/dev/null; then
+    echo "another supercaffeinate is already running (pid $OTHER), ignoring" >&2
+    return 1
+  fi
+  # stale lock from a killed run, take it over
+  rm -rf "$LOCKDIR"
+  mkdir "$LOCKDIR" 2>/dev/null || return 1
+  echo $$ > "$LOCKDIR/pid"
+  trap 'rm -rf "$LOCKDIR"' EXIT
+  return 0
+}
+
+blank_screen() {
+  if [ ! -f "$BLANK_PID" ] || ! kill -0 "$(cat "$BLANK_PID")" 2>/dev/null; then
+    "$SCREENBLANK" >>/tmp/supercaffeinate.log 2>&1 &
+    echo $! > "$BLANK_PID"
+  fi
+}
+
+unblank_screen() {
+  if [ -f "$BLANK_PID" ]; then
+    kill "$(cat "$BLANK_PID")" 2>/dev/null
+    rm -f "$BLANK_PID"
+  fi
+  pkill -x screenblank 2>/dev/null
+}
+
+# Background loop (runs as "supercaffeinate __watch" so off can pkill strays):
+# keep a display-hold caffeinate running at all times (display never sleeps,
+# so the lock screen never triggers), and follow the lid with the gamma helper:
+# close = screen to black via screenblank, open = kill it (gamma auto-restores).
+# Re-evaluated every tick: while an external display is online the blank is
+# never applied (closed + external = unblanked, unplug while closed = blanked).
+lid_watcher() {
+  was_blank=""
+  while true; do
+    # Always keep the display-hold caffeinate alive.
+    if [ ! -f "$DCAF_PID" ] || ! kill -0 "$(cat "$DCAF_PID")" 2>/dev/null; then
+      caffeinate -du &
+      echo $! > "$DCAF_PID"
+    fi
+
+    if lid_closed && ! external_display_online; then
+      blank_screen
+      was_blank=yes
+    else
+      if [ "$was_blank" != "no" ]; then
+        unblank_screen
+        was_blank=no
+      fi
+    fi
+    sleep 1
+  done
+}
+
+status() {
+  if [ -f "$STATE" ]; then
+    echo "supercaffeinate is ON (pid $(head -1 "$STATE"))"
+    if lid_closed; then
+      if external_display_online; then
+        echo "lid closed: showing on external display (no blank), system running"
+      else
+        echo "lid closed: screen blacked out, system running"
+      fi
+    else
+      echo "lid open: display held awake"
+    fi
+  else
+    echo "supercaffeinate is OFF"
+  fi
+}
+
+do_on() {
+  if is_on; then
+    echo "Already on."
+    return 0
+  fi
+
+  # Hold assertions: i=idle, m=disk, s=system (AC). The display hold lives in
+  # the lid watcher.
+  caffeinate -ims &
+  CAFPID=$!
+
+  # Remember current screensaver idle time before zeroing it.
+  PREV_IDLE=$(defaults -currentHost read com.apple.screensaver idleTime 2>/dev/null || echo 1200)
+
+  "$0" __watch &
+  WATCHPID=$!
+
+  # Write state FIRST so even a partially failed on can be toggled off.
+  printf '%s\n%s\n%s\n' "$CAFPID" "$PREV_IDLE" "$WATCHPID" > "$STATE"
+
+  defaults -currentHost write com.apple.screensaver idleTime -int 0
+
+  # Hard-disable sleep (blocks lid close and Apple menu > Sleep).
+  # sudo -n needs the NOPASSWD rule in /etc/sudoers.d/supercaffeinate.
+  if ! sudo -n pmset -a disablesleep 1 2>/dev/null; then
+    echo "warning: sudo -n pmset failed (run supercaffeinate-setup); lid close may sleep the machine" >&2
+  fi
+
+  echo "ON. No sleep, no screensaver, no auto-lock."
+  echo "Lid open: display stays on. Lid closed: screen dims to black, work keeps running."
+  echo "External display connected: lid-closed blank is skipped so the external screen stays on."
+  echo "Turn off with: supercaffeinate off  (or just reboot)"
+  notify "ON"
+}
+
+do_off() {
+  # Stop processes and clear state FIRST so off always de-caffeinates,
+  # even if the privileged restore steps below fail.
+  if [ -f "$STATE" ]; then
+    CAFPID=$(sed -n 1p "$STATE")
+    PREV_IDLE=$(sed -n 2p "$STATE")
+    WATCHPID=$(sed -n 3p "$STATE")
+    kill "$WATCHPID" 2>/dev/null
+    kill "$CAFPID" 2>/dev/null
+  else
+    PREV_IDLE=1200
+  fi
+  rm -f "$STATE"
+
+  # Sweep strays: watchers and holds from older or stacked runs.
+  pkill -f "$0 __watch" 2>/dev/null
+  pkill -f 'caffeinate -ims' 2>/dev/null
+  pkill -f 'caffeinate -dimsu' 2>/dev/null
+  if [ -f "$DCAF_PID" ]; then
+    kill "$(cat "$DCAF_PID")" 2>/dev/null
+    rm -f "$DCAF_PID"
+  fi
+  pkill -f 'caffeinate -du' 2>/dev/null
+
+  # If the watcher blacked out the screen, bring it back.
+  unblank_screen
+
+  defaults -currentHost write com.apple.screensaver idleTime -int "$PREV_IDLE"
+  if ! sudo -n pmset -a disablesleep 0 2>/dev/null; then
+    echo "warning: sudo -n pmset failed (run supercaffeinate-setup); disablesleep may still be 1" >&2
+  fi
+
+  echo "OFF. Normal sleep/lock behavior restored."
+  notify "OFF"
+}
+
+case "$1" in
+  __watch)
+    lid_watcher
+    ;;
+
+  on)
+    acquire_lock || exit 1
+    do_on
+    ;;
+
+  off)
+    acquire_lock || exit 1
+    do_off
+    ;;
+
+  toggle)
+    acquire_lock || exit 1
+    if is_on; then
+      do_off
+    else
+      do_on
+    fi
+    ;;
+
+  status|"")
+    status
+    ;;
+
+  *)
+    echo "Usage: supercaffeinate on|off|toggle|status"
+    exit 1
+    ;;
+esac
