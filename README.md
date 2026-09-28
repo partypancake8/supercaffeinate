@@ -4,6 +4,14 @@ Keeps a Mac fully awake until you turn it off, or for a set time: no system
 sleep, no display sleep, no screensaver, no auto-lock, and closing the lid does
 not put the machine to sleep. Controlled from the terminal or from a small menu bar app.
 
+## Menu bar app
+
+<p align="center"><img src="docs/menubar-icon.png" width="106" alt="SuperCaffeinate coffee cup icon in the macOS menu bar"></p>
+<p align="center"><em>The status item: a filled cup while awake, an outline cup while off.</em></p>
+
+<p align="center"><img src="docs/menubar-menu.png" width="323" alt="SuperCaffeinate menu open, showing Awake since 09:57, the lid state, Turn Off and Quit"></p>
+<p align="center"><em>The open menu while on: how long it has been awake, what the lid is doing, and the switch.</em></p>
+
 <p align="center"><img src="menubar/icon/AppIcon-1024.png" width="160" alt="SuperCaffeinate app icon"></p>
 
 ## What it does
